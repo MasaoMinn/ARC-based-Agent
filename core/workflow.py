@@ -4,6 +4,7 @@ import os
 import shutil
 import hashlib
 import json
+import traceback
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Awaitable, Callable
@@ -462,7 +463,7 @@ class ARCWorkflowManager:
             self._save_processing_queue(queue_state)
 
             await self._log("Compiler", f"Running {phase} for node {node_id}...", node_id=node_id)
-            task_ok = await self._run_task(task)
+            task_ok = await self._run_task_with_error_boundary(task)
 
             if task_ok:
                 task["status"] = TASK_COMPLETED
@@ -1132,6 +1133,39 @@ class ARCWorkflowManager:
                 test_ids=task.get("test_ids") or [],
             )
         return await self.phase_runner.run_implement_phase(node_id, requirement_data)
+
+    async def _run_task_with_error_boundary(self, task: dict[str, Any]) -> bool:
+        """Convert an agent-stage exception into a normal failed task.
+
+        ARC's queue already knows how to persist and report failed requirement
+        nodes.  Letting a provider, parsing, or tool exception escape here skips
+        that recovery path and makes the ARC-Bench runner see only exit status 1.
+        SystemExit and cancellation-style BaseException subclasses are left
+        untouched so real process termination still behaves normally.
+        """
+        try:
+            return await self._run_task(task)
+        except Exception as exc:
+            node_id = str(task.get("node_id") or "").strip() or None
+            phase = str(task.get("phase") or "").strip() or "UNKNOWN"
+            detail = f"{type(exc).__name__}: {exc}"
+            append_debug_log(
+                "Compiler",
+                (
+                    f"Unhandled {phase} task exception was contained and the task was marked failed.\n"
+                    f"{traceback.format_exc()}"
+                ),
+                status="error",
+                node_id=node_id,
+                workspace_root=self.workspace_path,
+            )
+            await self._log(
+                "Compiler",
+                f"{phase} failed with {detail}; continuing with the remaining requirement queue.",
+                "error",
+                node_id,
+            )
+            return False
 
     async def _commit_phase_checkpoint(self, node_id: str, phase: str, requirement_data: dict[str, Any]) -> None:
         commit_message = build_commit_message(node_id, phase, requirement_data)

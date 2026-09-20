@@ -105,8 +105,6 @@ class TestRecord:
     interface_ids: list[str] | None = None
     passed: bool | None = None
     scenario_id: str | None = None
-    scenario_ids: list[str] | None = None
-    obligation_ids: list[str] | None = None
 
 
 class TraceabilityStore:
@@ -483,8 +481,6 @@ class TraceabilityStore:
         interface_ids: list[str] | None = None,
         passed: bool | None = None,
         scenario_id: str | None = None,
-        scenario_ids: list[str] | None = None,
-        obligation_ids: list[str] | None = None,
         emit_event: bool = True,
     ) -> None:
         normalized_test_id = str(test_id or "").strip()
@@ -497,11 +493,6 @@ class TraceabilityStore:
                 f"Test id collision detected for `{normalized_test_id}`: "
                 f"existing req_id=`{existing.get('req_id')}`, new req_id=`{normalized_req_id}`."
             )
-        normalized_scenario_ids = _as_str_list(scenario_ids)
-        normalized_scenario_id = _as_optional_str(scenario_id) or (normalized_scenario_ids[0] if normalized_scenario_ids else None)
-        if normalized_scenario_id and normalized_scenario_id not in normalized_scenario_ids:
-            normalized_scenario_ids.insert(0, normalized_scenario_id)
-        normalized_obligation_ids = _as_str_list(obligation_ids)
         self._upsert_row(
             "tests",
             normalized_test_id,
@@ -513,9 +504,7 @@ class TraceabilityStore:
                 "file_path": _as_optional_str(file_path),
                 "passed": _as_bool_or_none(passed),
                 "first_line": _as_optional_str(first_line),
-                "scenario_id": normalized_scenario_id,
-                "scenario_ids": normalized_scenario_ids,
-                "obligation_ids": normalized_obligation_ids,
+                "scenario_id": _as_optional_str(scenario_id),
             },
         )
         if emit_event:
@@ -524,9 +513,7 @@ class TraceabilityStore:
                     "type": "test_upsert",
                     "test_id": normalized_test_id,
                     "req_id": normalized_req_id,
-                    "scenario_id": normalized_scenario_id,
-                    "scenario_ids": normalized_scenario_ids,
-                    "obligation_ids": normalized_obligation_ids,
+                    "scenario_id": _as_optional_str(scenario_id),
                     "test_type": str(type or "").strip(),
                     "file_path": _as_optional_str(file_path),
                     "first_line": _as_optional_str(first_line),
@@ -548,8 +535,6 @@ class TraceabilityStore:
             interface_ids=_as_str_list(merged.get("interface_ids")),
             passed=_as_bool_or_none(merged.get("passed")),
             scenario_id=merged.get("scenario_id"),
-            scenario_ids=_as_str_list(merged.get("scenario_ids")),
-            obligation_ids=_as_str_list(merged.get("obligation_ids")),
         )
 
     def set_test_pass_status(self, test_id: str, passed: bool | None) -> None:

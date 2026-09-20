@@ -346,8 +346,6 @@ class ContextPipeline:
                 "file_path": str(test.get("file_path", "") or "").strip(),
                 "first_line": str(test.get("first_line", "") or "").strip(),
                 "type": str(test.get("type", "") or "").strip(),
-                "obligation_ids": self._limit_string_list(test.get("obligation_ids") or [], limit=8, item_limit=100),
-                "scenario_ids": self._limit_string_list(test.get("scenario_ids") or [], limit=8, item_limit=100),
                 "interface_ids": self._limit_string_list(test.get("interface_ids") or [], limit=6, item_limit=80),
                 "passed": test.get("passed"),
                 "why_relevant": "Current-node generated test artifact.",

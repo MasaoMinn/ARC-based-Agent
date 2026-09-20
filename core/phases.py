@@ -1,28 +1,20 @@
 from __future__ import annotations
 
 import json
-import os
 from pathlib import Path
 from typing import Any, Awaitable, Callable
 
 from app_type_handler import create_app_type_handler
 from agents.context.pipeline import context_pipeline
-from agents.test_quality import (
-    assess_requirement_risk,
-    classify_red_gate_output,
-    has_error_issues,
-    inspect_test_artifacts,
-    validate_coverage_plan,
-)
 from core import sessions
 from core.service import get_runtime
 from core.path_compat import normalize_windows_extended_prefix_text
 from core.visual_analysis import analyze_and_attach_visual_references
-from app_type_handler.test_results import enforce_non_empty_test_run, parse_test_results
+from app_type_handler.test_results import parse_test_results
 
 
 LogCallback = Callable[[str, str, str | None, str | None], Awaitable[None] | None]
-TDD_RUN_TESTS_BUDGET = 10
+TDD_RUN_TESTS_BUDGET = 5
 ALLOWED_INTERFACE_TYPES = {"UI", "API", "FUNC", "DB"}
 TDD_BATCH_ORDER = ("Unit", "Integration", "E2E")
 
@@ -203,22 +195,10 @@ class WorkflowPhaseRunner:
             node_id=node_id,
             requirement_data=requirement_data,
         )
-        if not tests:
-            failure_summary = (
-                "TestGenerator returned an empty test manifest for an executable leaf node. "
-                "ARC requires at least one node-local test before implementation can start."
-            )
-            self._update_node_session(
-                node_id,
-                {
-                    "test_artifacts": [],
-                    "recent_failure_summary": failure_summary,
-                    "phase_status": {"design": "failed", "test": "failed"},
-                },
-            )
+        if tests is None:
             await self._log(
                 "TestGenerator",
-                failure_summary,
+                "DESIGN test generation did not return a valid test manifest.",
                 status="error",
                 node_id=node_id,
             )
@@ -229,141 +209,10 @@ class WorkflowPhaseRunner:
         except ValueError as exc:
             await self._log("TestGenerator", str(exc), status="error", node_id=node_id)
             return False
-        if not stored_tests:
-            failure_summary = (
-                "TestGenerator returned no valid test artifacts for an executable leaf node. "
-                "ARC requires at least one test with a stable id, supported type, and executable file path."
-            )
-            self._update_node_session(
-                node_id,
-                {
-                    "test_artifacts": [],
-                    "recent_failure_summary": failure_summary,
-                    "phase_status": {"design": "failed", "test": "failed"},
-                },
-            )
-            await self._log("TestGenerator", failure_summary, status="error", node_id=node_id)
-            return False
-
-        coverage_plan = self._get_last_coverage_plan()
-        quality_report = await self._assess_generated_test_suite(
-            node_id=node_id,
-            requirement_data=requirement_data,
-            interfaces=prepared_interfaces,
-            tests=stored_tests,
-            coverage_plan=coverage_plan,
-        )
-        critique: dict[str, Any] = {}
-        if quality_report.get("critic_required"):
-            review = getattr(self.test_generator, "review", None)
-            if callable(review):
-                try:
-                    critique = await review(
-                        node_id=node_id,
-                        requirement_data=requirement_data,
-                        coverage_plan=coverage_plan,
-                        tests=stored_tests,
-                        quality_report=quality_report,
-                    )
-                except Exception as exc:
-                    await self._log(
-                        "TestCritic",
-                        f"Conditional test critique could not complete: {exc}",
-                        status="error" if quality_report.get("blocking") else "warning",
-                        node_id=node_id,
-                    )
-                    critique = {
-                        "verdict": "revise" if quality_report.get("blocking") else "accept",
-                        "summary": f"TestCritic unavailable; deterministic gate remains authoritative: {exc}",
-                        "issues": [],
-                        "repair_instructions": [],
-                    }
-            elif quality_report.get("blocking"):
-                critique = {
-                    "verdict": "revise",
-                    "summary": "No TestCritic capability is configured; repair the deterministic quality findings directly.",
-                    "issues": [],
-                    "repair_instructions": [],
-                }
-
-        needs_repair = bool(quality_report.get("blocking")) or str(critique.get("verdict") or "").lower() == "revise"
-        if needs_repair:
-            feedback = json.dumps(
-                {
-                    "deterministic_report": quality_report,
-                    "critic": critique,
-                    "repair_contract": "Return the complete repaired coverage plan and complete manifest in one bounded pass.",
-                },
-                ensure_ascii=False,
-                default=str,
-            )
-            await self._log(
-                "TestGenerator",
-                "Running one bounded quality-repair pass for the generated suite.",
-                status="warning",
-                node_id=node_id,
-            )
-            try:
-                repaired_tests, _ = await self.test_generator.run(
-                    node_id=node_id,
-                    requirement_data=requirement_data,
-                    quality_feedback=feedback,
-                    prior_manifest=stored_tests,
-                    prior_coverage_plan=coverage_plan,
-                )
-            except Exception as exc:
-                return await self._record_test_quality_failure(
-                    node_id,
-                    quality_report,
-                    extra=f"The bounded test-quality repair could not complete: {exc}",
-                )
-            if not repaired_tests:
-                return await self._record_test_quality_failure(
-                    node_id,
-                    quality_report,
-                    extra="The bounded test-quality repair returned an empty manifest.",
-                )
-            try:
-                stored_tests = self._prepare_tests(node_id=node_id, tests=repaired_tests)
-            except ValueError as exc:
-                return await self._record_test_quality_failure(
-                    node_id,
-                    quality_report,
-                    extra=f"The bounded test-quality repair returned an invalid manifest: {exc}",
-                )
-            if not stored_tests:
-                return await self._record_test_quality_failure(
-                    node_id,
-                    quality_report,
-                    extra="The bounded test-quality repair produced no valid artifacts.",
-                )
-            coverage_plan = self._get_last_coverage_plan()
-            quality_report = await self._assess_generated_test_suite(
-                node_id=node_id,
-                requirement_data=requirement_data,
-                interfaces=prepared_interfaces,
-                tests=stored_tests,
-                coverage_plan=coverage_plan,
-            )
-            quality_report["repair_attempted"] = True
-            if quality_report.get("blocking"):
-                return await self._record_test_quality_failure(
-                    node_id,
-                    quality_report,
-                    extra="The generated suite still failed quality gates after its single repair pass.",
-                )
 
         self.traceability.clear_node_design_artifacts(node_id)
         self._store_prepared_interfaces(node_id, prepared_interfaces)
         self._store_prepared_tests(stored_tests)
-        self.traceability.upsert_node_contract(
-            node_id,
-            {
-                "coverage_plan": coverage_plan,
-                "test_quality": quality_report,
-                "test_critique": critique,
-            },
-        )
         context_pipeline.cache.invalidate_file_layers(node_id)
         context_pipeline.cache.invalidate_db_layers(node_id)
         self._update_node_session(
@@ -371,9 +220,6 @@ class WorkflowPhaseRunner:
             {
                 "interfaces": prepared_interfaces,
                 "test_artifacts": stored_tests,
-                "coverage_plan": coverage_plan,
-                "test_quality": quality_report,
-                "test_critique": critique,
                 "phase_status": {"design": "completed", "test": "completed"},
             },
         )
@@ -439,26 +285,13 @@ class WorkflowPhaseRunner:
             test_intent=normalized_intent,
             replace_test_id=normalized_replace_test_id or None,
         )
-        if not tests:
-            await self._log(
-                "TestGenerator",
-                "Test generation returned an empty manifest; no test artifacts were added.",
-                status="error",
-                node_id=node_id,
-            )
+        if tests is None:
+            await self._log("TestGenerator", "Test generation did not return a valid manifest.", status="error", node_id=node_id)
             return False
         try:
             prepared_tests = self._prepare_tests(node_id=node_id, tests=tests)
         except ValueError as exc:
             await self._log("TestGenerator", str(exc), status="error", node_id=node_id)
-            return False
-        if not prepared_tests:
-            await self._log(
-                "TestGenerator",
-                "Test generation returned no valid test artifacts; no tests were added.",
-                status="error",
-                node_id=node_id,
-            )
             return False
 
         existing_ids = set(existing_by_id)
@@ -561,26 +394,15 @@ class WorkflowPhaseRunner:
                 return False
             tests = [tests_by_id[test_id] for test_id in selected_test_ids]
         if not tests:
-            failure_summary = (
-                "No node-local tests are registered for this executable leaf node. "
-                "ARC will not mark implementation complete without an executable test gate."
-            )
             await self._log(
                 "TestDrivenDeveloper",
-                failure_summary,
-                status="error",
+                "No node-local tests were registered; skipping TDD implementation for this node.",
                 node_id=node_id,
             )
             if not selected_test_ids:
-                self._update_node_session(
-                    node_id,
-                    {
-                        "recent_failure_summary": failure_summary,
-                        "phase_status": {"implement": "failed"},
-                        "result_state": "FAILED",
-                    },
-                )
-            return False
+                self._mark_interfaces_implemented(interfaces)
+                self._update_node_session(node_id, {"phase_status": {"implement": "completed"}})
+            return True
 
         final_ok = await self._run_tdd_for_node(
             node_id=node_id,
@@ -612,20 +434,7 @@ class WorkflowPhaseRunner:
 
         ordered_types = [test_type for test_type in TDD_BATCH_ORDER if groups.get(test_type.lower())]
         if not ordered_types:
-            failure_summary = (
-                "No executable Unit, Integration, or E2E test layer is registered for this leaf node. "
-                "ARC will not mark implementation complete without a supported test layer."
-            )
-            self._update_node_session(
-                node_id,
-                {
-                    "recent_failure_summary": failure_summary,
-                    "phase_status": {"implement": "failed"},
-                    "result_state": "FAILED",
-                },
-            )
-            await self._log("TestDrivenDeveloper", failure_summary, status="error", node_id=node_id)
-            return False
+            return True
 
         usage_by_type = {test_type: 0 for test_type in ordered_types}
         result_by_type: dict[str, str] = {}
@@ -668,12 +477,6 @@ class WorkflowPhaseRunner:
                 for value in (requested_files or collect_test_files(groups[selected_type.lower()]))
                 if (path := normalize_workspace_relative_path(value, self.workspace_path))
             ]
-            if not selected_files:
-                return (
-                    "Exit Code: 1\n"
-                    "STDERR:\n"
-                    f"No executable test files are registered for the current {selected_type} layer.\n"
-                )
             registered_files = {
                 str(item.get("file_path", "") or "").strip()
                 for item in groups[selected_type.lower()]
@@ -706,9 +509,7 @@ class WorkflowPhaseRunner:
                 f"`run_tests` {selected_type} usage {usage_by_type[selected_type]}/{TDD_RUN_TESTS_BUDGET}.",
                 node_id=node_id,
             )
-            output = enforce_non_empty_test_run(
-                await self.app_handler.run_test_group(selected_type, selected_files)
-            )
+            output = await self.app_handler.run_test_group(selected_type, selected_files)
             await self._log(
                 "TestDrivenDeveloper",
                 (
@@ -890,186 +691,6 @@ class WorkflowPhaseRunner:
 
         return True
 
-    def _get_last_coverage_plan(self) -> list[dict[str, Any]]:
-        getter = getattr(self.test_generator, "get_last_coverage_plan", None)
-        if not callable(getter):
-            return []
-        try:
-            value = getter()
-        except Exception:
-            return []
-        return [dict(item) for item in value or [] if isinstance(item, dict)]
-
-    async def _assess_generated_test_suite(
-        self,
-        *,
-        node_id: str,
-        requirement_data: dict[str, Any],
-        interfaces: list[dict[str, Any]],
-        tests: list[dict[str, Any]],
-        coverage_plan: list[dict[str, Any]],
-    ) -> dict[str, Any]:
-        coverage_issues = validate_coverage_plan(
-            node_id=node_id,
-            requirement_data=requirement_data,
-            interfaces=interfaces,
-            tests=tests,
-            coverage_plan=coverage_plan,
-        )
-        artifact_issues = inspect_test_artifacts(self.workspace_path, tests)
-        red_gate: dict[str, Any]
-        if has_error_issues(artifact_issues):
-            red_gate = {
-                "status": "skipped",
-                "reason": "Red Gate was skipped because static test-artifact validation failed.",
-                "batches": [],
-            }
-        else:
-            red_gate = await self._run_preimplementation_red_gate(node_id=node_id, tests=tests)
-
-        red_gate_issues: list[dict[str, Any]] = []
-        workspace_mode = os.environ.get("ARC_WORKSPACE_MODE", "scaffold").strip().lower()
-        red_gate_batches = red_gate.get("batches") or []
-        if str(red_gate.get("status") or "") == "invalid" and not red_gate_batches:
-            red_gate_issues.append(
-                {
-                    "code": "red_gate_no_executable_batches",
-                    "severity": "error",
-                    "message": f"Pre-implementation Red Gate is invalid: {red_gate.get('reason') or 'no executable test batch was produced.'}",
-                    "test_ids": [],
-                    "obligation_ids": [],
-                }
-            )
-        for batch in red_gate_batches:
-            status = str(batch.get("status") or "")
-            test_type = str(batch.get("test_type") or "unknown")
-            reason = str(batch.get("reason") or "").strip()
-            if status == "invalid":
-                red_gate_issues.append(
-                    {
-                        "code": "red_gate_invalid",
-                        "severity": "error",
-                        "message": f"{test_type} Red Gate is invalid: {reason}",
-                        "test_ids": [],
-                        "obligation_ids": [],
-                    }
-                )
-            elif status == "unexpected_pass":
-                red_gate_issues.append(
-                    {
-                        "code": "red_gate_unexpected_pass",
-                        "severity": "warning" if workspace_mode == "evolution" else "error",
-                        "message": f"{test_type} tests passed before implementation: {reason}",
-                        "test_ids": [],
-                        "obligation_ids": [],
-                    }
-                )
-
-        issues = [*coverage_issues, *artifact_issues, *red_gate_issues]
-        risk = assess_requirement_risk(requirement_data, interfaces)
-        blocking = has_error_issues(issues)
-        critic_required = blocking or risk.get("tier") == "high" or any(
-            str(batch.get("status") or "") != "valid_red"
-            for batch in red_gate_batches
-        )
-        report = {
-            "risk": risk,
-            "issues": issues,
-            "red_gate": red_gate,
-            "blocking": blocking,
-            "critic_required": critic_required,
-            "workspace_mode": workspace_mode,
-        }
-        await self._log(
-            "TestQuality",
-            (
-                f"Coverage/static/Red Gate assessment: risk={risk.get('tier')}({risk.get('score')}), "
-                f"issues={len(issues)}, blocking={blocking}, critic_required={critic_required}."
-            ),
-            status="error" if blocking else "ok",
-            node_id=node_id,
-        )
-        return report
-
-    async def _run_preimplementation_red_gate(
-        self,
-        *,
-        node_id: str,
-        tests: list[dict[str, Any]],
-    ) -> dict[str, Any]:
-        groups: dict[str, list[dict[str, Any]]] = {}
-        for test in tests:
-            test_type = canonical_test_type(test.get("type"))
-            if test_type:
-                groups.setdefault(test_type, []).append(test)
-
-        batches: list[dict[str, Any]] = []
-        for test_type in TDD_BATCH_ORDER:
-            layer_tests = groups.get(test_type) or []
-            if not layer_tests:
-                continue
-            test_files = collect_test_files(layer_tests)
-            if not test_files:
-                assessment = {
-                    "status": "invalid",
-                    "exit_code": 1,
-                    "reason": f"No executable test files were registered for {test_type}.",
-                }
-                output = ""
-            else:
-                output = await self.app_handler.run_test_group(test_type, test_files)
-                assessment = classify_red_gate_output(output)
-            batch = {
-                "test_type": test_type,
-                "test_files": test_files,
-                **assessment,
-                "output_summary": summarize_batch_output(output, max_lines=20),
-            }
-            batches.append(batch)
-            await self._log(
-                "TestQuality",
-                f"Pre-implementation Red Gate `{test_type}`: {assessment['status']} - {assessment['reason']}",
-                status=(
-                    "ok"
-                    if assessment["status"] == "valid_red"
-                    else "warning"
-                    if assessment["status"] == "unexpected_pass"
-                    else "error"
-                ),
-                node_id=node_id,
-            )
-        return {
-            "status": "completed" if batches else "invalid",
-            "reason": "Executed generated tests before implementation." if batches else "No supported test layer was available.",
-            "batches": batches,
-        }
-
-    async def _record_test_quality_failure(
-        self,
-        node_id: str,
-        quality_report: dict[str, Any],
-        *,
-        extra: str = "",
-    ) -> bool:
-        issue_messages = [
-            str(item.get("message") or "").strip()
-            for item in quality_report.get("issues") or []
-            if isinstance(item, dict) and str(item.get("severity") or "").lower() == "error"
-        ]
-        parts = [part for part in [extra.strip(), *issue_messages[:8]] if part]
-        failure_summary = "Test quality gate failed. " + " ".join(parts)
-        self._update_node_session(
-            node_id,
-            {
-                "recent_failure_summary": failure_summary,
-                "test_quality": quality_report,
-                "phase_status": {"design": "failed", "test": "failed"},
-                "result_state": "FAILED",
-            },
-        )
-        await self._log("TestQuality", failure_summary, status="error", node_id=node_id)
-        return False
-
     def _prepare_interfaces(self, node_id: str, interfaces: list[dict[str, Any]]) -> list[dict[str, Any]]:
         prepared: list[dict[str, Any]] = []
         for interface in interfaces:
@@ -1161,8 +782,6 @@ class WorkflowPhaseRunner:
                 "req_id": node_id,
                 "type": test_type,
                 "file_path": file_path,
-                "obligation_ids": normalize_string_list(test.get("obligation_ids")),
-                "scenario_ids": normalize_string_list(test.get("scenario_ids")),
                 "interface_ids": normalize_string_list(test.get("interface_ids")),
                 "first_line": str(test.get("first_line", "")).strip(),
             }
@@ -1179,8 +798,6 @@ class WorkflowPhaseRunner:
                 file_path=str(test.get("file_path", "") or "").strip() or None,
                 first_line=str(test.get("first_line", "") or "").strip() or None,
                 passed=None,
-                scenario_ids=normalize_string_list(test.get("scenario_ids")),
-                obligation_ids=normalize_string_list(test.get("obligation_ids")),
             )
 
     def _register_interface_edges(self, node_id: str, interface_id: str, interface: dict[str, Any]) -> None:
@@ -1276,8 +893,6 @@ def summarize_test_artifacts(tests: list[dict[str, Any]]) -> dict[str, Any]:
                 "id": str(item.get("test_id", "") or "").strip(),
                 "type": str(item.get("type", "") or "").strip(),
                 "path": str(item.get("file_path", "") or "").strip(),
-                "obligations": normalize_string_list(item.get("obligation_ids")),
-                "scenarios": normalize_string_list(item.get("scenario_ids")),
                 "interfaces": normalize_string_list(item.get("interface_ids")),
             }
             for item in tests

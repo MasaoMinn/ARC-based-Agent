@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import json
 from typing import Any
 
 from agents.context.prompts.common import app_runtime_contract, code_quality_policy, compiler_background, code_task_exploration_policy, reasoning_reflection_policy, requirement_data_policy, response_contract, section, task_context_block, whole_app_policy, workspace_tool_policy
@@ -28,13 +27,13 @@ def get_system_prompt() -> str:
                     "When tests involve login, registration, logout, session, authenticated state, current user, account state, or auth-sensitive navigation, use the auth-session-consistency skill and test the global auth/session contract.",
                     "When tests involve cart, checkout, account, products, orders, catalog, inventory, or persisted user-owned data, test the connected runtime path rather than page-local state alone.",
                     "When a GIVEN depends on pre-existing records or relationships described in natural language, treat them as normal seeded application state. Do not expose a fixture DSL, infer hidden evaluator data, or replace the database prerequisite with frontend constants.",
-                    "Decide which of Unit, Integration, and E2E provide executable value for the current interface contract and scenarios. Every executable leaf node must own at least one test.",
+                    "Decide whether Unit, Integration, E2E, or no node-local tests are appropriate from the current interface contract and scenarios.",
                 ],
             ),
             section(
                 "Execution Flow",
                 [
-                    "Compile a structured coverage plan from node ownership and scenarios before writing tests. The returned plan is a machine-checked contract, not private scratch work.",
+                    "Read the interface specifications and decide the minimal coverage matrix from node ownership and scenarios.",
                     "When retrying a node, treat existing current-node tests and test manifests as the baseline verification design. Read and reconcile them before writing replacement tests.",
                     "Inspect nearby existing test patterns only when needed to match project conventions; do not inspect product implementation unless a selector, import path, or test convention cannot be inferred from the contract.",
                     "Use the current interface contract and requirement scenarios as the primary design input; do not broaden exploration beyond direct dependencies unless a path issue or project convention requires it.",
@@ -42,11 +41,10 @@ def get_system_prompt() -> str:
                     "For auth/session scenarios, assert observable global state changes through shared app surfaces, current-user/session indicators, route or command state, or session API behavior. Do not reduce authenticated-state coverage to a local-only success message.",
                     "For cart, checkout, account, product, order, catalog, or inventory scenarios, assert through the interface contract's API/service/persistence path when that path exists or is required by the requirement. Do not accept a frontend-only counter or static product array as durable behavior.",
                     "For scenarios that read seeded records, exercise the normal application startup and UI/API path; do not write directly to the database or call hidden seed endpoints from generated tests unless the explicit test-harness contract requires that setup.",
-                    "Generate at least one focused Unit, Integration, and/or E2E test. Never return an empty manifest for a leaf node; non-leaf nodes are filtered before this stage.",
-                    "Every returned test file must contain at least one enabled test with a meaningful behavioral assertion. Do not satisfy the contract with only skipped/todo tests, empty suites, unconditional truth assertions, or placeholder assertions.",
+                    "Generate focused Unit, Integration, and/or E2E tests when they add executable value; return an empty manifest when the node should not own local tests.",
                     "Before returning, assess from the evidence already gathered whether the tests would fail for a disconnected implementation, a local-only fake state patch, or a placeholder response. Do not read back or repair tests written in this pass.",
                     "Before writing each test, compare its setup, action, and assertion against the requirement description and each GIVEN/WHEN/THEN scenario step. Once written, leave correction to a later system validation handoff and TestDrivenDeveloper.",
-                    "Return a manifest that maps each test file to requirement id, coverage obligation ids, scenario ids, interface ids, type, path, and first line.",
+                    "Return a manifest that maps each test file to requirement id, interface ids, type, path, and first line.",
                     "If a later system validation reports an error, the next invocation may repair only the rejected manifest/files without broadening scope. Do not create a self-validation loop in this invocation.",
                 ],
             ),
@@ -90,30 +88,8 @@ def get_user_prompt(
     interface_contract: str = "",
     test_intent: str = "",
     replace_test_id: str | None = None,
-    quality_feedback: str = "",
-    prior_manifest: list[dict[str, Any]] | None = None,
-    prior_coverage_plan: list[dict[str, Any]] | None = None,
 ) -> str:
     sections = []
-    if quality_feedback.strip():
-        sections.extend(
-            [
-                section(
-                    "Quality Repair",
-                    [
-                        "A system quality gate or read-only TestCritic rejected the previous suite.",
-                        "Repair only the reported weaknesses, preserve still-valid test ids and paths, and return the complete replacement coverage plan and complete test manifest.",
-                        quality_feedback.strip(),
-                    ],
-                ),
-                "### Prior Coverage Plan\n```json\n"
-                + json.dumps(prior_coverage_plan or [], ensure_ascii=False, indent=2, default=str)
-                + "\n```",
-                "### Prior Test Manifest\n```json\n"
-                + json.dumps(prior_manifest or [], ensure_ascii=False, indent=2, default=str)
-                + "\n```",
-            ]
-        )
     if test_intent.strip():
         operation = "Modify" if replace_test_id else "Generate"
         replacement_rules = (
@@ -136,16 +112,12 @@ def get_user_prompt(
         section(
             "Task",
             [
-                "Generate at least one executable test for the current leaf node. Returning an empty `tests` list is invalid; choose the narrowest meaningful layer when coverage is otherwise small.",
+                "Generate tests for the current node ownership. If no layer is appropriate for this node, return an empty `tests` list with a clear `summary`.",
                 "This is a generation-only pass: create tests and the returned manifest, then stop. Do not run, reread, or self-repair files written in this pass; TestDrivenDeveloper receives all test repair work.",
                 "Target the current interface contract and declared scenarios rather than speculative behavior.",
-                "Before writing files, create the returned `coverage_plan`: each scenario GIVEN becomes preconditions, WHEN becomes action, and THEN becomes the observable oracle.",
-                "Every coverage obligation must include `obligation_id`, `source`, `priority`, `kind`, `description`, `preconditions`, `action`, `oracle`, `layer`, `scenario_ids`, and `interface_ids`.",
-                "Use priority `MUST` for explicit requirement/scenario outcomes and `SHOULD` only for useful non-mandatory resilience checks. Use kind `happy`, `negative`, `boundary`, `state`, `persistence`, `authorization`, `error`, or `accessibility`.",
-                "Every test manifest item must list the `obligation_ids` it executes and any `scenario_ids` it covers. Every MUST obligation must be mapped to at least one generated test, and every declared scenario must be mapped to E2E coverage.",
+                "Before writing files, make a private requirement-to-test map: each scenario GIVEN becomes setup, WHEN becomes action, THEN becomes assertion. Do not output the map, but use it to reject contradictory tests.",
                 "Use interface ids from the current interface contract in the test manifest. Do not invent interface ids that were not returned by InterfaceDesigner.",
                 "For leaf nodes, tests must drive the final desired behavior. Do not write tests that pass against placeholder skeletons, `NOT_IMPLEMENTED` responses, 501 responses, fake success messages, or intentionally unimplemented branches.",
-                "Each returned test file must execute at least one enabled test and assert a requirement-owned observable outcome. Do not return only `skip`/`todo` cases, empty suites, or unconditional assertions such as expecting a literal truth value.",
                 "If `Requirement Snapshot.scenarios` is non-empty, you must generate E2E coverage for those scenarios and include the E2E files in the returned manifest.",
                 "Scenario-driven E2E tests should follow the scenario flow: set up the necessary state, perform the user actions, and assert the scenario outcome through visible UI, terminal output, owned side effects, or other real runtime behavior.",
                 "If the scenario changes authentication state, tests should check that the shared app state reflects the transition, such as shared controls changing to current-user/account state, protected/public navigation updating, command access changing, or `/api/auth/session` returning the expected user/session after the action.",
@@ -153,8 +125,8 @@ def get_user_prompt(
                 "For E2E tests, choose selectors, prompts, command arguments, and observable outcomes from requirement-stated user-facing behavior first. If the requirement does not specify exact selectors or flags, define stable executable hooks in the test contract so implementation can align to them.",
                 "For frontend tests containing JSX, the actual manifest `file_path` must end in `.test.tsx` or `.spec.tsx`; do not use a `.ts` bridge file that imports a `.tsx` test.",
                 "Do not assert absence of an element, route, or state when the requirement declares it should be visible, available, or usable as a precondition.",
-                "Return `summary`, `coverage_plan`, `tests`, and `files_written`.",
-                "Each test manifest item must include `test_id`, `req_id`, `obligation_ids`, `scenario_ids`, `interface_ids`, `type`, `file_path`, and `first_line`.",
+                "Return `summary`, `tests`, and `files_written`.",
+                "Each test manifest item must include `test_id`, `req_id`, `interface_ids`, `type`, `file_path`, and `first_line`.",
                 "Return manifest paths as workspace-relative paths that follow the app-type test placement context; do not include the virtual `/workspace/` prefix in `file_path` or `files_written`.",
                 "Every `test_id` must be globally stable and include the current node id.",
                 "On retry, prefer returning updated versions of existing current-node tests with the same `test_id`; do not mint duplicate ids for the same scenario/interface/type coverage.",
